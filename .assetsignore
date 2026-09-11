@@ -1,0 +1,6 @@
+wrangler.jsonc
+worker.js
+functions/
+netlify.toml
+node_modules/
+*.md
