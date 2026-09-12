@@ -1,50 +1,32 @@
-# Cloudflare Pages port
+# Cloudflare port — v2 (Workers + Static Assets)
 
-This is the same fixed app as the Netlify build (see `FIX-V15.md`) — every
-fix, no regressions reintroduced — retargeted at Cloudflare Pages. Only the
-serverless-function boundary changed; the HTML/CSS/app logic is untouched.
+## What changed from v1
+The first version of this port targeted classic Cloudflare **Pages** (a
+`/functions` folder, file-based routing, `onRequest(context)`). That's now
+Cloudflare's maintenance-mode product — their dashboard's Git-import flow
+defaults to their newer **Workers + Static Assets** model instead, which uses
+a completely different config. We confirmed this from the live deploy
+(`*.workers.dev`, not `*.pages.dev`, and every `/api` request 404ing while
+static files served fine — meaning no Worker script was ever wired up at all).
 
-## What actually changed (3 things, all mechanical)
-
-1. **`netlify/functions/api.mjs` → `functions/api.js`.** Netlify's Edge
-   Function signature is `export default async (req) => {...}`; Cloudflare
-   Pages Functions use file-based routing with
-   `export async function onRequest(context) { const req = context.request; }`.
-   All request-handling logic inside is identical — only the wrapper changed.
-
-2. **Upstream edge caching.** The Netlify version cached WFM/WFCD subrequests
-   with `next: { revalidate: ttl }` — that's a Next.js-style cache directive.
-   Cloudflare Workers/Pages use a different mechanism: `cf: { cacheTtl: ttl,
-   cacheEverything: true }` on the `fetch()` call. Swapped like-for-like.
-
-3. **Frontend fetch path.** Every `fetch('/.netlify/functions/api?route=...')`
-   became `fetch('/api?route=...')`, since `/functions/api.js` maps to the
-   route `/api` on Cloudflare. This is the one place the frontend JS itself
-   was touched, and it's a literal string swap — no logic changed.
-
-I deliberately did **not** try to keep the old `/.netlify/functions/api` path
-alive via a Cloudflare `_redirects` rule. Cloudflare's own docs are explicit
-that `_redirects` rules are not applied to requests that resolve to a Pages
-Function — so a rewrite into `/api` wouldn't reliably reach the function.
-Repointing the six fetch calls is a few-line, unambiguous fix; relying on
-undocumented redirect-to-Function behavior is exactly the kind of guess that
-put this project through 14 rounds of "fixes" before this one.
+## The actual files that matter now
+- **`wrangler.jsonc`** — declares `main: worker.js` (the entry point) and an
+  `assets` block pointing at the repo root, so Cloudflare serves every static
+  file directly and only invokes `worker.js` for `/api`.
+- **`worker.js`** — single Worker entry point. Same request-handling logic as
+  before; it now also owns falling back to `env.ASSETS.fetch(request)` for
+  every path that isn't `/api` (Workers doesn't auto-serve static assets the
+  way Pages did — the Worker script is responsible for that hand-off).
+- **`.assetsignore`** — keeps `wrangler.jsonc`, `worker.js`, the old
+  `functions/` folder, and the markdown docs from being uploaded as
+  publicly-servable static files.
+- `functions/api.js` and `netlify/` are left in the repo as inert history —
+  neither is read by this deployment model. Safe to delete later if you want
+  a cleaner repo.
 
 ## Deploying this
-
-**Drag-and-drop into the Cloudflare Pages dashboard will not pick up the
-`/functions` folder** — Cloudflare's own docs say direct-upload deploys don't
-compile Pages Functions; only Wrangler (CLI) or a Git-connected build do.
-
-Recommended path:
-```
-npm install -g wrangler      # if you don't already have it
-wrangler login
-wrangler pages deploy . --project-name=tennoforge
-```
-Or connect this as a Git repo to Cloudflare Pages (Dashboard → Workers &
-Pages → Create → Pages → Connect to Git) with build command left empty and
-output directory set to `/` — Pages will detect `/functions` automatically.
-
-No environment variables or bindings are required; the app only calls public,
-unauthenticated Warframe Market / WarframeStat endpoints.
+Since the repo is already Git-connected to a Cloudflare Workers project
+(confirmed by the live `*.workers.dev` URL), you don't need to reconnect
+anything. Just add these three files to the repo and push — Cloudflare
+Workers Builds (their CI/CD for Git-imported Workers) rebuilds on every push
+to the connected branch automatically.

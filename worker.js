@@ -21,11 +21,11 @@ function json(data, status=200, extra={}) {
   });
 }
 
-async function upstream(url, ttl, ctx) {
-  // Netlify CDN edge cache: repeat visitors don't hit WFM.
+async function upstream(url, ttl, timeoutMs = 6000) {
   const cached = await fetch(url, {
     headers: { "User-Agent": WFM_UA, "Accept": "application/json" },
-    cf: { cacheTtl: ttl, cacheEverything: true }
+    cf: { cacheTtl: ttl, cacheEverything: true },
+    signal: AbortSignal.timeout(timeoutMs)
   }).catch(() => null);
 
   if (!cached || !cached.ok) throw new Error(`Upstream ${cached?.status || "network"}: ${url}`);
@@ -34,6 +34,21 @@ async function upstream(url, ttl, ctx) {
 
 function normalizeSlug(q) {
   return q.toLowerCase().trim().replace(/['’]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+// The UI filter dropdown only ever sends one of: warframe, weapon, companion, mod.
+// WFM (tag array, order not guaranteed) and WFCD (capitalized, slot-specific
+// categories like "Primary"/"Arch-Gun"/"Warframes") each use a different,
+// inconsistent vocabulary — neither ever equals those four literal strings on
+// its own. This maps both onto the same fixed set so filtering actually works
+// regardless of which upstream source an item came from.
+function canonicalType(tags, categoryOrType) {
+  const text = [...(Array.isArray(tags) ? tags : []), categoryOrType || ""].join(" ").toLowerCase();
+  if (/\bmods?\b|arcane/.test(text)) return "mod";
+  if (/\bwarframes?\b/.test(text)) return "warframe";
+  if (/primary|secondary|melee|zaw|kitgun|arch-?gun|arch-?melee|archwing|weapon/.test(text)) return "weapon";
+  if (/companion|sentinel|pet\b|moa|hound|kubrow|kavat|predasite|vulpaphyla/.test(text)) return "companion";
+  return "other";
 }
 
 
@@ -47,6 +62,7 @@ function normalizeWarframeStat(x) {
     mr: x.masteryReq ?? x.masteryRank ?? x.reqMasteryRank ?? null,
     type: x.category || x.type || "item",
     category: x.category || x.type || null,
+    kind: canonicalType(x.tags, x.category || x.type),
     source: "WFCD / WarframeStat",
     tradable: x.tradable === true,
     uniqueName: x.uniqueName || null,
@@ -73,6 +89,7 @@ function normalizeWfm(x) {
     image:x.thumb||x.icon||x.image||i18n.thumb||i18n.icon||null,
     mr:x.reqMasteryRank??x.masteryRank??x.mr??null,
     type:x.type||x.group||x.tags?.[0]||"item",
+    kind:canonicalType(x.tags, x.type||x.group),
     source:"Warframe Market",
     tradable:true
   };
@@ -124,8 +141,12 @@ async function getFullCatalogue() {
 }
 
 async function getSearchCatalogue(q) {
-  // WFM gives marketable matches; WarframeStat gives the broad game catalogue.
-  // This avoids downloading WFCD's ~56 MB All.json on every cold Netlify invocation.
+  // WFCD's query-specific search endpoints are fast and avoid its ~56 MB
+  // All.json dump. WFM has no per-query search endpoint at all — /items always
+  // returns its full tradable catalogue (thousands of items), so we still pay
+  // that cost here, mitigated by edge caching (TTL.items) and the 6s timeout
+  // on upstream(): if it's cold/slow, safeJson() returns null and the search
+  // still completes from WFCD alone rather than hanging.
   const encoded=encodeURIComponent(q);
   const [wfmPayload, wfPayload, modPayload] = await Promise.all([
     safeJson(`${WFM_BASE}/items`, TTL.items),
@@ -139,13 +160,19 @@ async function getSearchCatalogue(q) {
   const apiWorked=!!(wfmPayload || wfPayload || modPayload);
   const broad=[...wfRaw,...modsRaw].map(normalizeWarframeStat);
 
+  // uniqueName (WFCD) and gameRef (WFM) are different, source-specific ID
+  // systems — they can never equal each other, so using either as the
+  // primary merge key meant these two sources almost never actually merged.
+  // A normalized slug (same hyphenation on both sides) is the one field
+  // that's genuinely comparable across sources; name is the fallback.
+  const mergeKey = x => (x.slug ? normalizeSlug(String(x.slug)) : String(x.name||"").toLowerCase().trim());
+
   const merged=new Map();
   for(const x of broad) {
-    const key=(x.uniqueName||x.slug||x.name).toLowerCase();
-    merged.set(key,x);
+    merged.set(mergeKey(x),x);
   }
   for(const x of wfm) {
-    const key=(x.gameRef||x.slug||x.name).toString().toLowerCase();
+    const key=mergeKey(x);
     const prior=merged.get(key);
     merged.set(key, prior ? {...prior,...x,source:"WFCD / WarframeStat + Warframe Market"} : x);
   }
@@ -246,23 +273,19 @@ async function handleApi(req) {
       const q = (u.searchParams.get("q") || "").trim().toLowerCase();
       if (!q) return json({query:"",items:[]});
 
-      // Query-specific upstream calls: no multi-megabyte WFCD download.
       const catalogResult = await getSearchCatalogue(q);
       const all = catalogResult.results;
       const terms = q.split(/\s+/).filter(Boolean);
       const scored = all.map(x => {
-        // WFM v2 stores display name/images inside i18n.<language>.
-        const i18n = x.i18n?.en || x.i18n?.["en-us"] || Object.values(x.i18n || {})[0] || {};
-        const name = x.name || x.itemName || i18n.name || x.slug?.replaceAll("_"," ");
-        const image = x.thumb || x.icon || x.image || i18n.thumb || i18n.icon || null;
-        const mr = x.reqMasteryRank ?? x.masteryRank ?? x.mr ?? x.masteryRankRequirement ?? null;
-        const normalized = {...x, name, image, mr, type: x.type || x.group || x.tags?.[0] || "item"};
-        const text = [x.slug,name,x.itemName,x.type,x.group,x.subtype,...(x.tags||[])].filter(Boolean).join(" ").toLowerCase();
+        // x already carries clean name/image/mr/type/kind from normalizeWfm /
+        // normalizeWarframeStat — no need to re-derive them here.
+        const kind = x.kind || canonicalType(x.tags, x.type || x.group);
+        const text = [x.slug,x.name,x.itemName,x.type,x.group,x.subtype,...(x.tags||[])].filter(Boolean).join(" ").toLowerCase();
         let score = 0;
         if (text.includes(q)) score += 100;
         for (const t of terms) if (text.includes(t)) score += 15;
         if ((x.name||"").toLowerCase() === q) score += 1000;
-        return {...normalized,_score:score};
+        return {...x, kind, _score:score};
       }).filter(x=>x._score>0).sort((a,b)=>b._score-a._score).slice(0,40)
         .map(({_score,...x})=>x);
       return json({
